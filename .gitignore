@@ -1,0 +1,6 @@
+.build/
+dist/*
+!dist/Codex Usage.zip
+content/
+Assets/AppIcon-opaque-backup.png
+.DS_Store
