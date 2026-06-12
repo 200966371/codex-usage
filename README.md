@@ -74,6 +74,24 @@ codex://threads/{threadId}
 
 ## 安装和运行
 
+### 下载已打包版本
+
+普通用户建议直接下载 GitHub Releases 里的 `Codex.Usage.zip`：
+
+```text
+https://github.com/200966371/codex-usage/releases
+```
+
+下载后：
+
+1. 解压 `Codex.Usage.zip`。
+2. 双击打开 `Codex Usage.app`。
+3. 如果 macOS 提示无法验证开发者，右键 `Codex Usage.app`，选择 `打开`。
+4. 如仍被拦截，到 `系统设置 -> 隐私与安全性`，点击 `仍要打开`。
+5. 打开后看 Mac 右上角菜单栏。
+
+可以直接放在下载目录运行。想长期使用时，再把 `Codex Usage.app` 移到 Finder 里的 `应用程序` 文件夹。程序坞只是快捷入口，不是安装位置；这个工具是菜单栏 App，一般不需要固定到程序坞。
+
 ### 直接运行源码
 
 要求：
