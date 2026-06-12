@@ -2063,7 +2063,7 @@ private struct LaunchAtLoginButton: View {
             HStack(spacing: 6) {
                 Image(systemName: isEnabled ? "checkmark.circle.fill" : "poweron")
                     .font(.system(size: 11, weight: .semibold))
-                Text("启动")
+                Text("开机启动")
                     .font(.system(size: 11, weight: .semibold))
             }
             .foregroundStyle(isEnabled ? Color.black.opacity(0.82) : palette.secondaryText)
