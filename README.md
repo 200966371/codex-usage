@@ -109,11 +109,13 @@ open -n "dist/Codex Usage.app"
 
 ## 分享给别人
 
-可以直接分享构建好的 zip：
+安装包不放在源码目录里分发，下载入口在 GitHub Releases：
 
 ```text
-dist/Codex Usage.zip
+https://github.com/200966371/codex-usage/releases
 ```
+
+当前发布附件名是 `Codex.Usage.zip`。
 
 当前版本没有开发者签名和 notarize。别人第一次打开时，macOS 可能提示无法验证开发者。正式公开分发前，建议补上：
 
