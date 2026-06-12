@@ -197,19 +197,6 @@ enum TaskStatusMapper {
             records.append(record(from: thread, kind: kind))
         }
 
-        for id in unreadThreadIDs.subtracting(representedThreadIDs) {
-            records.append(
-                TaskRecord(
-                    id: id,
-                    title: "未读 Codex 对话",
-                    subtitle: String(id.prefix(8)),
-                    cwd: nil,
-                    updatedAt: nil,
-                    kind: .completedUnread
-                )
-            )
-        }
-
         return TaskStatusSnapshot(
             records: sorted(records),
             unreadThreadIDs: unreadThreadIDs,

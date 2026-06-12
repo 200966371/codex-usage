@@ -40,38 +40,50 @@ final class CodexTaskStatusClient {
 
         do {
             let threads = try await appServerClient.fetchThreads()
-            let waitingThreads = await localRuntimeReader.fetchWaitingReplyThreads(unreadThreadIDs: unreadIDs)
-            let summaryThreads = await localRuntimeReader.fetchThreadSummaries(
+            let archivedIDs = await localRuntimeReader.fetchArchivedThreadIDs(
                 threadIDs: unreadIDs.union(threads.map(\.id))
             )
-            let mergedThreads = Self.merged(primary: threads, supplemental: waitingThreads)
+            let visibleUnreadIDs = unreadIDs.subtracting(archivedIDs)
+            let visibleThreads = threads.filter { !archivedIDs.contains($0.id) }
+            let waitingThreads = await localRuntimeReader.fetchWaitingReplyThreads(unreadThreadIDs: visibleUnreadIDs)
+            let summaryThreads = await localRuntimeReader.fetchThreadSummaries(
+                threadIDs: visibleUnreadIDs.union(visibleThreads.map(\.id))
+            )
+            let mergedThreads = Self.merged(primary: visibleThreads, supplemental: waitingThreads)
             let decoratedThreads = Self.applyingSummaries(to: mergedThreads, summaries: summaryThreads)
             let snapshotThreads = Self.appendingMissing(
                 existing: decoratedThreads,
-                supplemental: summaryThreads.filter { unreadIDs.contains($0.id) }
+                supplemental: summaryThreads.filter { visibleUnreadIDs.contains($0.id) }
             )
+            let snapshotUnreadIDs = Self.knownUnreadIDs(visibleUnreadIDs, in: snapshotThreads)
             return TaskStatusMapper.makeSnapshot(
                 threads: snapshotThreads,
-                unreadThreadIDs: unreadIDs,
+                unreadThreadIDs: snapshotUnreadIDs,
                 refreshedAt: refreshedAt,
                 sourceState: .available
             )
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let localThreads = await localRuntimeReader.fetchActiveThreads()
-            let waitingThreads = await localRuntimeReader.fetchWaitingReplyThreads(unreadThreadIDs: unreadIDs)
-            let summaryThreads = await localRuntimeReader.fetchThreadSummaries(
+            let archivedIDs = await localRuntimeReader.fetchArchivedThreadIDs(
                 threadIDs: unreadIDs.union(localThreads.map(\.id))
             )
-            let mergedThreads = Self.merged(primary: localThreads, supplemental: waitingThreads)
+            let visibleUnreadIDs = unreadIDs.subtracting(archivedIDs)
+            let visibleLocalThreads = localThreads.filter { !archivedIDs.contains($0.id) }
+            let waitingThreads = await localRuntimeReader.fetchWaitingReplyThreads(unreadThreadIDs: visibleUnreadIDs)
+            let summaryThreads = await localRuntimeReader.fetchThreadSummaries(
+                threadIDs: visibleUnreadIDs.union(visibleLocalThreads.map(\.id))
+            )
+            let mergedThreads = Self.merged(primary: visibleLocalThreads, supplemental: waitingThreads)
             let decoratedThreads = Self.applyingSummaries(to: mergedThreads, summaries: summaryThreads)
             let threads = Self.appendingMissing(
                 existing: decoratedThreads,
-                supplemental: summaryThreads.filter { unreadIDs.contains($0.id) }
+                supplemental: summaryThreads.filter { visibleUnreadIDs.contains($0.id) }
             )
+            let snapshotUnreadIDs = Self.knownUnreadIDs(visibleUnreadIDs, in: threads)
             return TaskStatusMapper.makeSnapshot(
                 threads: threads,
-                unreadThreadIDs: unreadIDs,
+                unreadThreadIDs: snapshotUnreadIDs,
                 refreshedAt: refreshedAt,
                 sourceState: threads.isEmpty ? .unavailable(message) : .available
             )
@@ -149,6 +161,11 @@ final class CodexTaskStatusClient {
 
         let existingIDs = Set(existing.map(\.id))
         return existing + supplemental.filter { !existingIDs.contains($0.id) }
+    }
+
+    private static func knownUnreadIDs(_ unreadIDs: Set<String>, in threads: [CodexThreadDTO]) -> Set<String> {
+        let threadIDs = Set(threads.map(\.id))
+        return unreadIDs.intersection(threadIDs)
     }
 
     private static func usefulText(_ text: String?) -> String? {
@@ -281,6 +298,15 @@ private final class CodexLocalRuntimeReader {
         }.value
     }
 
+    func fetchArchivedThreadIDs(threadIDs: Set<String>) async -> Set<String> {
+        guard !threadIDs.isEmpty else {
+            return []
+        }
+        return await Task.detached(priority: .utility) {
+            self.fetchArchivedThreadIDsSynchronously(threadIDs: threadIDs)
+        }.value
+    }
+
     func fetchWaitingReplyThreads(unreadThreadIDs: Set<String>) async -> [CodexThreadDTO] {
         return await Task.detached(priority: .utility) {
             self.fetchWaitingReplyThreadsSynchronously(unreadThreadIDs: unreadThreadIDs, now: Date())
@@ -316,16 +342,11 @@ private final class CodexLocalRuntimeReader {
             unreadThreadIDs: unreadThreadIDs,
             requiresUnread: false
         )
-        let archivedThreads = waitingReplyThreads(
-            from: recentConversationFiles(now: now, maxAge: waitingReplyWindow, roots: [archivedSessionsURL]),
-            unreadThreadIDs: unreadThreadIDs,
-            requiresUnread: true
-        )
-        return Self.deduplicated(liveThreads + archivedThreads)
+        return Self.deduplicated(liveThreads)
     }
 
     private func fetchThreadSummariesSynchronously(threadIDs: Set<String>, now: Date) -> [CodexThreadDTO] {
-        recentConversationFiles(now: now, maxAge: summaryWindow, roots: [sessionsURL, archivedSessionsURL])
+        recentConversationFiles(now: now, maxAge: summaryWindow, roots: [sessionsURL])
             .compactMap { file in
                 guard let metadata = readMetadata(from: file.url) else {
                     return nil
@@ -343,6 +364,38 @@ private final class CodexLocalRuntimeReader {
                     name: preview == "Codex 对话" ? nil : shortTitle(from: preview)
                 )
             }
+    }
+
+    private func fetchArchivedThreadIDsSynchronously(threadIDs: Set<String>) -> Set<String> {
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: archivedSessionsURL,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            )
+        else {
+            return []
+        }
+
+        var archivedIDs = Set<String>()
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent.hasPrefix("rollout-"), url.pathExtension == "jsonl" else {
+                continue
+            }
+            guard
+                let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                values.isRegularFile == true,
+                let id = threadID(from: url),
+                threadIDs.contains(id)
+            else {
+                continue
+            }
+            archivedIDs.insert(id)
+            if archivedIDs.count == threadIDs.count {
+                break
+            }
+        }
+        return archivedIDs
     }
 
     private func waitingReplyThreads(
