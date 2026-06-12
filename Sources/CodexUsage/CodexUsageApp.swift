@@ -219,6 +219,29 @@ enum AppearanceMode: String, CaseIterable, Equatable {
     }
 }
 
+private enum DashboardSection: String, CaseIterable {
+    case usage
+    case tasks
+
+    var title: String {
+        switch self {
+        case .usage:
+            return "用量"
+        case .tasks:
+            return "任务"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .usage:
+            return "chart.bar.fill"
+        case .tasks:
+            return "figure.run"
+        }
+    }
+}
+
 private struct AppPalette {
     let isDark: Bool
 
@@ -624,6 +647,7 @@ final class UsageStore: ObservableObject {
 
     private let client = CodexUsageClient()
     private var activitySnapshots: [ActivityDay: ActivitySnapshot] = [:]
+    private var isRefreshing = false
 
     var fiveHour: UsageWindow? {
         windows.first { $0.id == "five_hour" } ?? windows.first
@@ -639,28 +663,47 @@ final class UsageStore: ObservableObject {
 
     var statusTitle: String {
         switch state {
+        case .loading where !windows.isEmpty:
+            return usageStatusTitle
         case .idle, .loading:
             return "Codex ..."
         case .failed:
             return "Codex 检查"
         case .loaded:
-            let first = fiveHour.map { "5h \($0.remainingInt)%" }
-            let second = sevenDay.map { "7d \($0.remainingInt)%" }
-            let compact = [first, second].compactMap { $0 }.joined(separator: "  ")
-            if let lowest = lowestRemaining, lowest <= 10 {
-                return "低 " + compact
-            }
-            return compact
+            return usageStatusTitle
         }
     }
 
     var statusTone: StatusTone {
-        guard case .loaded = state else {
-            if case .failed = state {
-                return .offline
+        switch state {
+        case .loaded:
+            return usageStatusTone
+        case .loading:
+            guard !windows.isEmpty else {
+                return .loading
             }
+            return usageStatusTone
+        case .failed:
+            return .offline
+        case .idle:
             return .loading
         }
+    }
+
+    private var usageStatusTitle: String {
+        let first = fiveHour.map { "5h \($0.remainingInt)%" }
+        let second = sevenDay.map { "7d \($0.remainingInt)%" }
+        let compact = [first, second].compactMap { $0 }.joined(separator: "  ")
+        guard !compact.isEmpty else {
+            return "Codex 检查"
+        }
+        if let lowest = lowestRemaining, lowest <= 10 {
+            return "低 " + compact
+        }
+        return compact
+    }
+
+    private var usageStatusTone: StatusTone {
         guard let lowest = lowestRemaining else {
             return .offline
         }
@@ -674,8 +717,15 @@ final class UsageStore: ObservableObject {
     }
 
     func refresh() {
+        guard !isRefreshing else {
+            return
+        }
+        isRefreshing = true
         state = .loading
         Task {
+            defer {
+                isRefreshing = false
+            }
             do {
                 let next = try await client.fetch()
                 let snapshots = await Task.detached(priority: .utility) {
@@ -772,38 +822,10 @@ enum StatusTone {
     }
 }
 
-private enum StatusIcon {
-    static func make(tone: StatusTone) -> NSImage {
-        let size = NSSize(width: 18, height: 18)
-        let image = NSImage(size: size)
-        image.lockFocus()
-
-        let bounds = NSRect(origin: .zero, size: size)
-        NSColor.clear.setFill()
-        bounds.fill()
-
-        let base = NSBezierPath(roundedRect: NSRect(x: 2, y: 2, width: 14, height: 14), xRadius: 4, yRadius: 4)
-        NSColor(calibratedWhite: 0.14, alpha: 0.92).setFill()
-        base.fill()
-
-        let stroke = NSBezierPath(roundedRect: NSRect(x: 2.5, y: 2.5, width: 13, height: 13), xRadius: 3.5, yRadius: 3.5)
-        NSColor(calibratedWhite: 1, alpha: 0.16).setStroke()
-        stroke.lineWidth = 1
-        stroke.stroke()
-
-        tone.nsColor.setFill()
-        NSBezierPath(roundedRect: NSRect(x: 5, y: 5, width: 3, height: 8), xRadius: 1.2, yRadius: 1.2).fill()
-        NSBezierPath(roundedRect: NSRect(x: 10, y: 5, width: 3, height: 5), xRadius: 1.2, yRadius: 1.2).fill()
-
-        image.unlockFocus()
-        image.isTemplate = false
-        return image
-    }
-}
-
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let store = UsageStore()
+    private let taskStore = TaskStatusStore()
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var cancellables: Set<AnyCancellable> = []
@@ -821,11 +843,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 468, height: 528)
+        popover.contentSize = NSSize(width: 548, height: 640)
         popover.delegate = self
         popover.contentViewController = NSHostingController(
             rootView: PopoverView(
                 store: store,
+                taskStore: taskStore,
                 refresh: { [weak self] in self?.store.refresh() },
                 quit: { NSApp.terminate(nil) }
             )
@@ -834,6 +857,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         observeStore()
         updateStatusItem()
         store.refresh()
+        taskStore.startPolling()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.store.refresh()
@@ -841,8 +865,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        taskStore.stopPolling()
+    }
+
     private func observeStore() {
         store.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateStatusItem()
+            }
+        }
+        .store(in: &cancellables)
+
+        taskStore.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async {
                 self?.updateStatusItem()
             }
@@ -854,13 +890,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         guard let button = statusItem.button else {
             return
         }
-        button.image = StatusIcon.make(tone: store.statusTone)
+        button.image = TaskStatusStripIcon.make(snapshot: taskStore.snapshot, frame: taskStore.animationFrame)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]
         button.attributedTitle = NSAttributedString(string: " " + store.statusTitle, attributes: attributes)
-        button.toolTip = "Codex 用量：\(store.statusTone.text)"
+        button.toolTip = "\(taskStore.snapshot.tooltipText)\nCodex 用量：\(store.statusTone.text)"
     }
 
     @objc private func togglePopover() {
@@ -879,8 +915,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
 private struct PopoverView: View {
     @ObservedObject var store: UsageStore
+    @ObservedObject var taskStore: TaskStatusStore
     let refresh: () -> Void
     let quit: () -> Void
+    @State private var selectedSection: DashboardSection = .usage
     @Environment(\.colorScheme) private var systemScheme
 
     private var isDarkMode: Bool {
@@ -914,6 +952,7 @@ private struct PopoverView: View {
 
             VStack(spacing: 0) {
                 header
+                sectionSwitch
                 Divider().overlay(palette.divider)
                 content
                 Divider().overlay(palette.divider)
@@ -921,7 +960,7 @@ private struct PopoverView: View {
             }
             .foregroundStyle(palette.primaryText)
         }
-        .frame(width: 468, height: 528)
+        .frame(width: 548, height: 640)
         .preferredColorScheme(isDarkMode ? .dark : .light)
     }
 
@@ -941,9 +980,9 @@ private struct PopoverView: View {
             .frame(width: 30, height: 30)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Codex 用量")
+                Text("Codex 工作台")
                     .font(.system(size: 15, weight: .semibold))
-                Text(lastUpdatedText)
+                Text(headerSubtitle)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(palette.secondaryText)
             }
@@ -952,26 +991,73 @@ private struct PopoverView: View {
 
             HStack(spacing: 8) {
                 StatusBadge(tone: store.statusTone, palette: palette)
-                IconButton(systemName: "arrow.clockwise", palette: palette, action: refresh)
+                IconButton(systemName: "arrow.clockwise", palette: palette, action: refreshCurrentSection)
             }
         }
         .padding(.horizontal, 34)
         .padding(.top, 22)
-        .padding(.bottom, 18)
+        .padding(.bottom, 12)
+    }
+
+    private var sectionSwitch: some View {
+        HStack(spacing: 6) {
+            ForEach(DashboardSection.allCases, id: \.rawValue) { section in
+                Button {
+                    selectedSection = section
+                    if section == .tasks {
+                        taskStore.refreshNow()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: section.icon)
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(section.title)
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .foregroundStyle(section == selectedSection ? Color.black.opacity(0.84) : palette.secondaryText)
+                    .background(
+                        section == selectedSection
+                            ? Color(red: 0.36, green: 0.86, blue: 0.58)
+                            : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8)
+                    )
+                    .contentShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+            }
+        }
+        .padding(4)
+        .background(palette.control, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.border, lineWidth: 1))
+        .padding(.horizontal, 34)
+        .padding(.bottom, 14)
     }
 
     @ViewBuilder
     private var content: some View {
+        switch selectedSection {
+        case .usage:
+            usageContent
+        case .tasks:
+            tasksContent
+        }
+    }
+
+    @ViewBuilder
+    private var usageContent: some View {
         switch store.state {
-        case .idle, .loading:
-            VStack(spacing: 14) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("正在检查 Codex 额度")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(palette.secondaryText)
+        case .idle:
+            usageLoading
+        case .loading:
+            if store.windows.isEmpty {
+                usageLoading
+            } else {
+                usageSnapshot
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed(let message):
             VStack(alignment: .leading, spacing: 18) {
                 HStack(spacing: 12) {
@@ -992,14 +1078,119 @@ private struct PopoverView: View {
             .padding(.horizontal, 30)
             .padding(.vertical, 26)
         case .loaded:
-            VStack(spacing: 16) {
-                quotaGrid
-                rhythm
-                privacyNote
-            }
-            .padding(.horizontal, 30)
-            .padding(.vertical, 22)
+            usageSnapshot
         }
+    }
+
+    private var usageLoading: some View {
+        VStack(spacing: 14) {
+            ProgressView()
+                .controlSize(.small)
+            Text("正在检查 Codex 额度")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(palette.secondaryText)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var usageSnapshot: some View {
+        VStack(spacing: 16) {
+            quotaGrid
+            rhythm
+            privacyNote
+        }
+        .padding(.horizontal, 30)
+        .padding(.vertical, 22)
+    }
+
+    private var tasksContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            taskOverview
+            taskStatusNote
+            taskList
+        }
+        .padding(.horizontal, 26)
+        .padding(.vertical, 18)
+        .onAppear {
+            taskStore.refreshNow()
+        }
+    }
+
+    private var taskOverview: some View {
+        HStack(spacing: 8) {
+            let visibleKinds = TaskStatusKind.menuOrder.filter { taskStore.snapshot.count(for: $0) > 0 }
+            if visibleKinds.isEmpty {
+                TaskStatBlock(
+                    title: "空闲",
+                    value: "0",
+                    kind: .idle,
+                    palette: palette
+                )
+            } else {
+                ForEach(visibleKinds, id: \.rawValue) { kind in
+                    TaskStatBlock(
+                        title: kind.shortTitle,
+                        value: "\(taskStore.snapshot.count(for: kind))",
+                        kind: kind,
+                        palette: palette
+                    )
+                }
+            }
+        }
+    }
+
+    private var taskStatusNote: some View {
+        HStack(spacing: 9) {
+            Image(systemName: taskStatusIcon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(taskStatusColor)
+            Text(taskStore.stateText)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(palette.secondaryText)
+                .lineLimit(2)
+            Spacer()
+            if let refreshedAt = taskStore.snapshot.refreshedAt {
+                Text(relativeTimeText(refreshedAt))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(palette.mutedText)
+            }
+        }
+        .padding(11)
+        .background(palette.panelSoft, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.border, lineWidth: 1))
+    }
+
+    private var taskList: some View {
+        Group {
+            if taskStore.snapshot.visibleRecords.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "figure.stand")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(palette.mutedText)
+                    Text(taskStore.snapshot.sourceState.isUnavailable ? "暂时读不到运行状态" : "没有需要盯着的任务")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text(taskStore.snapshot.sourceState.isUnavailable ? "Codex app-server 不在线时，额度显示不会受影响。" : "运行、完成未读、确认或回复请求出现时会在这里列出来。")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(palette.secondaryText)
+                        .multilineTextAlignment(.center)
+                    ActionRow(systemName: "terminal.fill", title: "打开 Codex", palette: palette) {
+                        openCodexApp()
+                    }
+                    .frame(width: 220)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 9) {
+                        ForEach(taskStore.snapshot.visibleRecords) { task in
+                            TaskRow(record: task, palette: palette)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var quotaGrid: some View {
@@ -1127,6 +1318,24 @@ private struct PopoverView: View {
         .padding(.vertical, 16)
     }
 
+    private var headerSubtitle: String {
+        switch selectedSection {
+        case .usage:
+            return lastUpdatedText
+        case .tasks:
+            return taskStore.lastUpdatedText
+        }
+    }
+
+    private func refreshCurrentSection() {
+        switch selectedSection {
+        case .usage:
+            refresh()
+        case .tasks:
+            taskStore.refreshNow()
+        }
+    }
+
     private var lastUpdatedText: String {
         if case .loading = store.state {
             return "正在同步"
@@ -1211,6 +1420,172 @@ private struct PopoverView: View {
             return String(format: "%.1fK", Double(value) / 1_000)
         }
         return "\(value)"
+    }
+
+    private var taskStatusIcon: String {
+        switch taskStore.state {
+        case .idle, .loading:
+            return "arrow.triangle.2.circlepath"
+        case .available:
+            return taskStore.snapshot.hasVisibleStatus ? "bolt.fill" : "checkmark.circle.fill"
+        case .unavailable:
+            return "wifi.slash"
+        }
+    }
+
+    private var taskStatusColor: Color {
+        switch taskStore.state {
+        case .idle, .loading:
+            return Color(red: 0.42, green: 0.78, blue: 0.95)
+        case .available:
+            return taskStore.snapshot.hasVisibleStatus ? Color(red: 0.36, green: 0.86, blue: 0.58) : palette.mutedText
+        case .unavailable:
+            return Color(red: 0.96, green: 0.72, blue: 0.28)
+        }
+    }
+
+    private func relativeTimeText(_ date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 {
+            return "刚刚"
+        }
+        return "\(seconds / 60) 分钟前"
+    }
+
+    private func openCodexApp() {
+        let codexApp = URL(fileURLWithPath: "/Applications/Codex.app")
+        if FileManager.default.fileExists(atPath: codexApp.path) {
+            NSWorkspace.shared.open(codexApp)
+        }
+    }
+}
+
+private struct TaskStatBlock: View {
+    let title: String
+    let value: String
+    let kind: TaskStatusKind
+    let palette: AppPalette
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: kind.popoverIcon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(kind.swiftColor)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(value)
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                Text(title)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(palette.mutedText)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity)
+        .background(kind.swiftColor.opacity(palette.isDark ? 0.12 : 0.10), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(kind.swiftColor.opacity(0.20), lineWidth: 1))
+    }
+}
+
+private struct TaskRow: View {
+    let record: TaskRecord
+    let palette: AppPalette
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(record.kind.swiftColor.opacity(palette.isDark ? 0.16 : 0.13))
+                Image(systemName: record.kind.popoverIcon)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(record.kind.swiftColor)
+            }
+            .frame(width: 30, height: 30)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text(record.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                    Text(record.kind.title)
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(record.kind.swiftColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(record.kind.swiftColor.opacity(palette.isDark ? 0.16 : 0.11), in: RoundedRectangle(cornerRadius: 5))
+                }
+
+                Text(record.displaySubtitle)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(palette.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                if let updatedAt = record.updatedAt {
+                    Text(relativeTimeText(updatedAt))
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(palette.faintText)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(palette.panel, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.border, lineWidth: 1))
+        .help(record.cwd ?? record.displaySubtitle)
+    }
+
+    private func relativeTimeText(_ date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 {
+            return "刚刚更新"
+        }
+        if seconds < 3_600 {
+            return "\(seconds / 60) 分钟前更新"
+        }
+        return "\(seconds / 3_600) 小时前更新"
+    }
+}
+
+private extension TaskStatusKind {
+    var swiftColor: Color {
+        switch self {
+        case .error:
+            return Color(red: 1.0, green: 0.35, blue: 0.32)
+        case .needsConfirmation:
+            return Color(red: 0.96, green: 0.72, blue: 0.28)
+        case .needsReply:
+            return Color(red: 0.52, green: 0.63, blue: 1.0)
+        case .running:
+            return Color(red: 0.28, green: 0.72, blue: 0.98)
+        case .completedUnread:
+            return Color(red: 0.36, green: 0.86, blue: 0.58)
+        case .idle, .unknown:
+            return Color.gray.opacity(0.72)
+        }
+    }
+
+    var popoverIcon: String {
+        switch self {
+        case .error:
+            return "exclamationmark.circle.fill"
+        case .needsConfirmation:
+            return "hand.tap.fill"
+        case .needsReply:
+            return "bubble.left.and.text.bubble.right.fill"
+        case .running:
+            return "figure.run"
+        case .completedUnread:
+            return "figure.2.arms.open"
+        case .idle:
+            return "figure.stand"
+        case .unknown:
+            return "questionmark.circle.fill"
+        }
     }
 }
 

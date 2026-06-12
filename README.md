@@ -1,12 +1,14 @@
 # Codex Usage
 
-一个 macOS 右上角菜单栏小工具，用来直接查看 Codex 用量：
+一个 macOS 右上角菜单栏小工具，用来查看 Codex 用量和任务状态：
 
 ```text
 5h 83%  7d 90%
 ```
 
-弹窗里会显示 5 小时 / 7 天剩余额度、今日/昨日 24 小时本机 token 活动、外观模式和开机启动。
+弹窗里会显示 5 小时 / 7 天剩余额度、今日/昨日 24 小时本机 token 活动、Codex 任务状态、外观模式和开机启动。
+
+任务状态会显示运行中、完成未读、需要确认、需要回复和错误状态；菜单栏里用动态小图标和数字做摘要。
 
 ## 本地运行
 
@@ -59,5 +61,6 @@ App 只读本机数据：
 - Codex OAuth：优先读 macOS Keychain 的 `Codex Auth`
 - 兜底读 `~/.codex/auth.json`
 - 今日/昨日活动读 `~/.codex/sessions`
+- 任务状态读 Codex app-server 和 `~/.codex/.codex-global-state.json`
 
 Token 和会话日志只留在本机。
