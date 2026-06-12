@@ -41,8 +41,17 @@ final class CodexTaskStatusClient {
         do {
             let threads = try await appServerClient.fetchThreads()
             let waitingThreads = await localRuntimeReader.fetchWaitingReplyThreads(unreadThreadIDs: unreadIDs)
+            let summaryThreads = await localRuntimeReader.fetchThreadSummaries(
+                threadIDs: unreadIDs.union(threads.map(\.id))
+            )
+            let mergedThreads = Self.merged(primary: threads, supplemental: waitingThreads)
+            let decoratedThreads = Self.applyingSummaries(to: mergedThreads, summaries: summaryThreads)
+            let snapshotThreads = Self.appendingMissing(
+                existing: decoratedThreads,
+                supplemental: summaryThreads.filter { unreadIDs.contains($0.id) }
+            )
             return TaskStatusMapper.makeSnapshot(
-                threads: Self.merged(primary: threads, supplemental: waitingThreads),
+                threads: snapshotThreads,
                 unreadThreadIDs: unreadIDs,
                 refreshedAt: refreshedAt,
                 sourceState: .available
@@ -51,7 +60,15 @@ final class CodexTaskStatusClient {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let localThreads = await localRuntimeReader.fetchActiveThreads()
             let waitingThreads = await localRuntimeReader.fetchWaitingReplyThreads(unreadThreadIDs: unreadIDs)
-            let threads = Self.merged(primary: localThreads, supplemental: waitingThreads)
+            let summaryThreads = await localRuntimeReader.fetchThreadSummaries(
+                threadIDs: unreadIDs.union(localThreads.map(\.id))
+            )
+            let mergedThreads = Self.merged(primary: localThreads, supplemental: waitingThreads)
+            let decoratedThreads = Self.applyingSummaries(to: mergedThreads, summaries: summaryThreads)
+            let threads = Self.appendingMissing(
+                existing: decoratedThreads,
+                supplemental: summaryThreads.filter { unreadIDs.contains($0.id) }
+            )
             return TaskStatusMapper.makeSnapshot(
                 threads: threads,
                 unreadThreadIDs: unreadIDs,
@@ -99,6 +116,46 @@ final class CodexTaskStatusClient {
         }
 
         return mergedPrimary + supplemental.filter { !primaryIDs.contains($0.id) }
+    }
+
+    private static func applyingSummaries(to threads: [CodexThreadDTO], summaries: [CodexThreadDTO]) -> [CodexThreadDTO] {
+        guard !summaries.isEmpty else {
+            return threads
+        }
+
+        var summariesByID: [String: CodexThreadDTO] = [:]
+        for summary in summaries where summariesByID[summary.id] == nil {
+            summariesByID[summary.id] = summary
+        }
+        return threads.map { thread in
+            guard let summary = summariesByID[thread.id] else {
+                return thread
+            }
+            return CodexThreadDTO(
+                id: thread.id,
+                preview: usefulText(summary.preview) ?? thread.preview,
+                cwd: summary.cwd ?? thread.cwd,
+                updatedAt: thread.updatedAt ?? summary.updatedAt,
+                status: thread.status,
+                name: usefulText(summary.name) ?? thread.name
+            )
+        }
+    }
+
+    private static func appendingMissing(existing: [CodexThreadDTO], supplemental: [CodexThreadDTO]) -> [CodexThreadDTO] {
+        guard !supplemental.isEmpty else {
+            return existing
+        }
+
+        let existingIDs = Set(existing.map(\.id))
+        return existing + supplemental.filter { !existingIDs.contains($0.id) }
+    }
+
+    private static func usefulText(_ text: String?) -> String? {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed == "Codex 对话" ? nil : trimmed
     }
 
     private static func hasReminderFlag(_ status: CodexThreadDTO.RuntimeStatus) -> Bool {
@@ -183,6 +240,7 @@ private final class CodexLocalRuntimeReader {
     private let activeWindow: TimeInterval
     private let pendingCallWindow: TimeInterval
     private let waitingReplyWindow: TimeInterval
+    private let summaryWindow: TimeInterval
     private let maxTailBytes: UInt64
     private let maxFiles: Int
 
@@ -194,6 +252,7 @@ private final class CodexLocalRuntimeReader {
         activeWindow: TimeInterval = 10 * 60,
         pendingCallWindow: TimeInterval = 60 * 60,
         waitingReplyWindow: TimeInterval = 24 * 60 * 60,
+        summaryWindow: TimeInterval = 7 * 24 * 60 * 60,
         maxTailBytes: UInt64 = 512 * 1024,
         maxFiles: Int = 40
     ) {
@@ -202,6 +261,7 @@ private final class CodexLocalRuntimeReader {
         self.activeWindow = activeWindow
         self.pendingCallWindow = pendingCallWindow
         self.waitingReplyWindow = waitingReplyWindow
+        self.summaryWindow = summaryWindow
         self.maxTailBytes = maxTailBytes
         self.maxFiles = maxFiles
     }
@@ -209,6 +269,15 @@ private final class CodexLocalRuntimeReader {
     func fetchActiveThreads() async -> [CodexThreadDTO] {
         await Task.detached(priority: .utility) {
             self.fetchActiveThreadsSynchronously(now: Date())
+        }.value
+    }
+
+    func fetchThreadSummaries(threadIDs: Set<String>) async -> [CodexThreadDTO] {
+        guard !threadIDs.isEmpty else {
+            return []
+        }
+        return await Task.detached(priority: .utility) {
+            self.fetchThreadSummariesSynchronously(threadIDs: threadIDs, now: Date())
         }.value
     }
 
@@ -229,7 +298,7 @@ private final class CodexLocalRuntimeReader {
 
             let metadata = readMetadata(from: file.url)
             let id = metadata?.id ?? threadID(from: file.url) ?? file.url.deletingPathExtension().lastPathComponent
-            let preview = metadata?.preview ?? "运行中的 Codex 任务"
+            let preview = latestUserPreview(from: tail) ?? metadata?.preview ?? "运行中的 Codex 任务"
             return CodexThreadDTO(
                 id: id,
                 preview: preview,
@@ -255,6 +324,27 @@ private final class CodexLocalRuntimeReader {
         return Self.deduplicated(liveThreads + archivedThreads)
     }
 
+    private func fetchThreadSummariesSynchronously(threadIDs: Set<String>, now: Date) -> [CodexThreadDTO] {
+        recentConversationFiles(now: now, maxAge: summaryWindow, roots: [sessionsURL, archivedSessionsURL])
+            .compactMap { file in
+                guard let metadata = readMetadata(from: file.url) else {
+                    return nil
+                }
+                guard threadIDs.contains(metadata.id) else {
+                    return nil
+                }
+                let preview = readTailLines(from: file.url).flatMap(latestUserPreview) ?? metadata.preview ?? "Codex 对话"
+                return CodexThreadDTO(
+                    id: metadata.id,
+                    preview: preview,
+                    cwd: metadata.cwd,
+                    updatedAt: file.modifiedAt.timeIntervalSince1970,
+                    status: .init(type: "idle", activeFlags: nil),
+                    name: preview == "Codex 对话" ? nil : shortTitle(from: preview)
+                )
+            }
+    }
+
     private func waitingReplyThreads(
         from files: [(url: URL, modifiedAt: Date)],
         unreadThreadIDs: Set<String>,
@@ -274,7 +364,7 @@ private final class CodexLocalRuntimeReader {
                     return nil
                 }
 
-                let preview = metadata?.preview ?? "等待回复的 Codex 任务"
+                let preview = latestUserPreview(from: tail) ?? metadata?.preview ?? "等待回复的 Codex 任务"
                 return CodexThreadDTO(
                     id: id,
                     preview: preview,
@@ -397,7 +487,10 @@ private final class CodexLocalRuntimeReader {
 
             if type == "response_item", payloadType == "message" {
                 let role = payload?["role"] as? String
-                if role == "user" {
+                if role == "user", messageText(from: payload?["content"])?.contains("<turn_aborted>") == true {
+                    lastTerminalIndex = index
+                    pendingCalls.removeAll()
+                } else if role == "user" {
                     lastUserIndex = index
                 } else if role == "assistant", phase == "final_answer" || phase == "final" {
                     lastTerminalIndex = index
@@ -410,6 +503,11 @@ private final class CodexLocalRuntimeReader {
 
             if type == "event_msg", payloadType == "task_complete" {
                 lastTerminalIndex = index
+            }
+
+            if type == "event_msg", payloadType == "turn_aborted" {
+                lastTerminalIndex = index
+                pendingCalls.removeAll()
             }
 
             if type == "event_msg", payloadType == "agent_message", phase == "final_answer" || phase == "final" {
@@ -428,6 +526,10 @@ private final class CodexLocalRuntimeReader {
             if type == "response_item", payloadType == "function_call_output" {
                 if let callID = payload?["call_id"] as? String {
                     pendingCalls.removeValue(forKey: callID)
+                }
+                if (payload?["output"] as? String)?.contains("aborted by user") == true {
+                    lastTerminalIndex = index
+                    pendingCalls.removeAll()
                 }
             }
         }
@@ -530,8 +632,17 @@ private final class CodexLocalRuntimeReader {
             }
 
             if type == "response_item", payloadType == "message", payload?["role"] as? String == "user" {
-                preview = messageText(from: payload?["content"])
-                break
+                if let candidate = messagePreview(from: payload?["content"]) {
+                    preview = candidate
+                    break
+                }
+            }
+
+            if type == "event_msg", payloadType == "user_message" {
+                if let message = payload?["message"] as? String, let candidate = userPreview(from: message) {
+                    preview = candidate
+                    break
+                }
             }
         }
 
@@ -539,6 +650,30 @@ private final class CodexLocalRuntimeReader {
             return nil
         }
         return SessionMetadata(id: resolvedID, cwd: cwd, preview: preview)
+    }
+
+    private func latestUserPreview(from lines: [String]) -> String? {
+        for line in lines.reversed() {
+            guard let object = jsonDictionary(from: line) else {
+                continue
+            }
+            let type = object["type"] as? String
+            let payload = object["payload"] as? [String: Any]
+            let payloadType = payload?["type"] as? String
+
+            if type == "event_msg", payloadType == "user_message" {
+                if let message = payload?["message"] as? String, let candidate = userPreview(from: message) {
+                    return candidate
+                }
+            }
+
+            if type == "response_item", payloadType == "message", payload?["role"] as? String == "user" {
+                if let candidate = messagePreview(from: payload?["content"]) {
+                    return candidate
+                }
+            }
+        }
+        return nil
     }
 
     private func jsonDictionary(from line: String) -> [String: Any]? {
@@ -559,19 +694,64 @@ private final class CodexLocalRuntimeReader {
     }
 
     private func messageText(from content: Any?) -> String? {
+        rawMessageText(from: content).flatMap(normalizedPreview)
+    }
+
+    private func messagePreview(from content: Any?) -> String? {
+        rawMessageText(from: content).flatMap(userPreview)
+    }
+
+    private func rawMessageText(from content: Any?) -> String? {
         if let text = content as? String {
-            return normalizedPreview(text)
+            return text
         }
         guard let parts = content as? [[String: Any]] else {
             return nil
         }
-        let text = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
-        return normalizedPreview(text)
+        return parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
+    }
+
+    private func userPreview(from text: String) -> String? {
+        var candidate = text
+        if let requestRange = candidate.range(of: "## My request for Codex:") {
+            candidate = String(candidate[requestRange.upperBound...])
+        }
+
+        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isInjectedUserContext(trimmed) else {
+            return nil
+        }
+
+        let cleaned = trimmed
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { line in
+                !line.isEmpty
+                    && !line.hasPrefix("# Files mentioned by the user:")
+                    && !line.hasPrefix("## My request for Codex:")
+                    && !line.hasPrefix("<image ")
+                    && !line.hasPrefix("</image")
+            }
+            .joined(separator: " ")
+            .replacingOccurrences(of: #"^#+\s*"#, with: "", options: .regularExpression)
+        return normalizedPreview(cleaned)
+    }
+
+    private func isInjectedUserContext(_ text: String) -> Bool {
+        text.isEmpty
+            || text.hasPrefix("# AGENTS.md instructions")
+            || text.hasPrefix("# Files mentioned by the user:")
+            || text.hasPrefix("<environment_context>")
+            || text.hasPrefix("<permissions instructions>")
+            || text.hasPrefix("<app-context>")
+            || text.hasPrefix("<collaboration_mode>")
+            || text.hasPrefix("========= MEMORY_SUMMARY BEGINS")
+            || text.contains("<turn_aborted>")
     }
 
     private func normalizedPreview(_ text: String) -> String? {
         let collapsed = text
-            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !collapsed.isEmpty else {
             return nil

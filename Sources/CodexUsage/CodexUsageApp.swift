@@ -827,7 +827,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     private let store = UsageStore()
     private let taskStore = TaskStatusStore()
     private var statusItem: NSStatusItem!
+    private var quotaStatusItem: NSStatusItem!
     private var popover: NSPopover!
+    private var taskPickerPopover: NSPopover!
     private var cancellables: Set<AnyCancellable> = []
     private var timer: Timer?
 
@@ -837,8 +839,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.target = self
-            button.action = #selector(togglePopover)
-            button.imagePosition = .imageLeft
+            button.action = #selector(handleTaskStatusItemClick(_:))
+            _ = button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.imagePosition = .imageOnly
+        }
+
+        quotaStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = quotaStatusItem.button {
+            button.target = self
+            button.action = #selector(handleQuotaStatusItemClick(_:))
+            _ = button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.imagePosition = .noImage
         }
 
         popover = NSPopover()
@@ -853,6 +864,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
                 quit: { NSApp.terminate(nil) }
             )
         )
+
+        taskPickerPopover = NSPopover()
+        taskPickerPopover.behavior = .transient
+        taskPickerPopover.delegate = self
 
         observeStore()
         updateStatusItem()
@@ -887,28 +902,135 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     }
 
     private func updateStatusItem() {
-        guard let button = statusItem.button else {
-            return
+        if let button = statusItem.button {
+            button.image = TaskStatusStripIcon.make(snapshot: taskStore.snapshot, frame: taskStore.animationFrame)
+            button.attributedTitle = NSAttributedString(string: "")
+            button.toolTip = taskStore.snapshot.tooltipText
         }
-        button.image = TaskStatusStripIcon.make(snapshot: taskStore.snapshot, frame: taskStore.animationFrame)
+
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]
-        button.attributedTitle = NSAttributedString(string: " " + store.statusTitle, attributes: attributes)
-        button.toolTip = "\(taskStore.snapshot.tooltipText)\nCodex 用量：\(store.statusTone.text)"
+        if let button = quotaStatusItem.button {
+            button.image = nil
+            button.attributedTitle = NSAttributedString(string: store.statusTitle, attributes: attributes)
+            button.toolTip = "Codex 用量：\(store.statusTone.text)"
+        }
     }
 
-    @objc private func togglePopover() {
-        guard let button = statusItem.button else {
+    @objc private func handleTaskStatusItemClick(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let shouldOpenFullPanel = event?.type == .rightMouseUp
+            || event?.modifierFlags.contains(.option) == true
+        if shouldOpenFullPanel {
+            showFullPopoverFromQuota()
             return
         }
+
+        let records = taskStore.snapshot.visibleRecords
+        switch records.count {
+        case 0:
+            taskStore.refreshNow()
+        case 1:
+            openTask(records[0])
+        default:
+            toggleTaskPicker(records: records, relativeTo: sender)
+        }
+    }
+
+    @objc private func handleQuotaStatusItemClick(_ sender: NSStatusBarButton) {
+        toggleFullPopover(relativeTo: sender)
+    }
+
+    private func showFullPopoverFromQuota() {
+        if let button = quotaStatusItem.button ?? statusItem.button {
+            showFullPopover(relativeTo: button)
+        }
+    }
+
+    private func toggleFullPopover(relativeTo button: NSStatusBarButton) {
+        taskPickerPopover.performClose(nil)
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            NSApp.activate(ignoringOtherApps: true)
+            showFullPopover(relativeTo: button)
         }
+    }
+
+    private func showFullPopover(relativeTo button: NSStatusBarButton) {
+        taskPickerPopover.performClose(nil)
+        guard !popover.isShown else {
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func toggleTaskPicker(records: [TaskRecord], relativeTo button: NSStatusBarButton) {
+        popover.performClose(nil)
+        if taskPickerPopover.isShown {
+            taskPickerPopover.performClose(nil)
+            return
+        }
+
+        let height = min(CGFloat(records.count) * 76 + 84, 420)
+        taskPickerPopover.contentSize = NSSize(width: 360, height: height)
+        taskPickerPopover.contentViewController = NSHostingController(
+            rootView: TaskPickerView(
+                records: records,
+                height: height,
+                openTask: { [weak self] record in
+                    self?.openTask(record)
+                },
+                openFullPanel: { [weak self] in
+                    guard let self else { return }
+                    self.taskPickerPopover.performClose(nil)
+                    self.showFullPopoverFromQuota()
+                }
+            )
+        )
+        taskPickerPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func openTask(_ record: TaskRecord) {
+        popover.performClose(nil)
+        taskPickerPopover.performClose(nil)
+        openCodexThread(threadID: record.id)
+    }
+
+    private func openCodexThread(threadID: String) {
+        guard
+            let encodedID = threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+            let url = URL(string: "codex://threads/\(encodedID)")
+        else {
+            openCodexApp()
+            return
+        }
+
+        if !NSWorkspace.shared.open(url) {
+            openCodexApp()
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.taskStore.refreshNow()
+        }
+    }
+
+    private func openCodexApp() {
+        let codexApp = URL(fileURLWithPath: "/Applications/Codex.app")
+        if FileManager.default.fileExists(atPath: codexApp.path) {
+            NSWorkspace.shared.open(codexApp)
+        }
+    }
+
+    @objc private func togglePopover() {
+        guard let button = quotaStatusItem.button ?? statusItem.button else {
+            return
+        }
+        toggleFullPopover(relativeTo: button)
     }
 
 }
@@ -1457,6 +1579,156 @@ private struct PopoverView: View {
         if FileManager.default.fileExists(atPath: codexApp.path) {
             NSWorkspace.shared.open(codexApp)
         }
+    }
+}
+
+private struct TaskPickerView: View {
+    let records: [TaskRecord]
+    let height: CGFloat
+    let openTask: (TaskRecord) -> Void
+    let openFullPanel: () -> Void
+    @Environment(\.colorScheme) private var systemScheme
+
+    private var palette: AppPalette {
+        AppPalette(isDark: systemScheme == .dark)
+    }
+
+    var body: some View {
+        ZStack {
+            VisualEffectView(material: palette.visualMaterial, blendingMode: .behindWindow)
+                .ignoresSafeArea()
+            LinearGradient(
+                colors: [palette.backgroundStart, palette.backgroundEnd],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color(red: 0.36, green: 0.86, blue: 0.58))
+                        .frame(width: 24, height: 24)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("选择 Codex 任务")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("\(records.count) 个任务状态")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+
+                Divider().overlay(palette.divider)
+
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(records) { record in
+                            TaskPickerRow(record: record, palette: palette) {
+                                openTask(record)
+                            }
+                        }
+                    }
+                    .padding(12)
+                }
+
+                Divider().overlay(palette.divider)
+
+                Button(action: openFullPanel) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "rectangle.grid.1x2.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("打开完整面板")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(palette.faintText)
+                    }
+                    .foregroundStyle(palette.secondaryText)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .foregroundStyle(palette.primaryText)
+        }
+        .frame(width: 360, height: height)
+    }
+}
+
+private struct TaskPickerRow: View {
+    let record: TaskRecord
+    let palette: AppPalette
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill(record.kind.swiftColor.opacity(palette.isDark ? 0.16 : 0.13))
+                    Image(systemName: record.kind.popoverIcon)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(record.kind.swiftColor)
+                }
+                .frame(width: 30, height: 30)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(record.title)
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1)
+                        Text(record.kind.title)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(record.kind.swiftColor)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(record.kind.swiftColor.opacity(palette.isDark ? 0.16 : 0.11), in: RoundedRectangle(cornerRadius: 5))
+                    }
+
+                    HStack(spacing: 6) {
+                        Text(record.displaySubtitle)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(palette.secondaryText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let updatedAt = record.updatedAt {
+                            Text(relativeTimeText(updatedAt))
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(palette.faintText)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(palette.mutedText)
+            }
+            .padding(10)
+            .background(palette.panel, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.border, lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .help(record.cwd ?? record.displaySubtitle)
+    }
+
+    private func relativeTimeText(_ date: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 60 {
+            return "刚刚"
+        }
+        if seconds < 3_600 {
+            return "\(seconds / 60) 分钟前"
+        }
+        return "\(seconds / 3_600) 小时前"
     }
 }
 

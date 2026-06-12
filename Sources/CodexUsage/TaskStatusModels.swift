@@ -201,7 +201,7 @@ enum TaskStatusMapper {
             records.append(
                 TaskRecord(
                     id: id,
-                    title: "完成未读任务",
+                    title: "未读 Codex 对话",
                     subtitle: String(id.prefix(8)),
                     cwd: nil,
                     updatedAt: nil,
