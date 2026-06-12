@@ -82,6 +82,8 @@ codex://threads/{threadId}
 https://github.com/200966371/codex-usage/releases
 ```
 
+不要下载 GitHub 自动生成的 `Source code (zip)` 或 `Source code (tar.gz)`，那两个是源码快照，不是可直接打开的 App 安装包。
+
 下载后：
 
 1. 解压 `Codex.Usage.zip`。
@@ -134,6 +136,8 @@ https://github.com/200966371/codex-usage/releases
 ```
 
 当前发布附件名是 `Codex.Usage.zip`。
+
+GitHub Release 页面里的 `Source code (zip)` 和 `Source code (tar.gz)` 是 GitHub 根据 tag 自动生成的源码包，不是安装包。
 
 当前版本没有开发者签名和 notarize。别人第一次打开时，macOS 可能提示无法验证开发者。正式公开分发前，建议补上：
 
